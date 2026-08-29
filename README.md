@@ -26,3 +26,14 @@ For example, a route can look like:
     "version": 1
   }
 }
+Running the nodes
+
+The project can be run as three local nodes.
+
+Start the first node:
+
+NODE_ID=node-a PORT=7100 cargo run
+
+In another terminal:
+
+NODE_ID=node-b PORT=7101 cargo run
