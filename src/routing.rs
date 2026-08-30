@@ -7,8 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::replication::RouteUpdate;
-use crate::state::{AppState, RouteEntry};
+use crate::replication::{DeleteUpdate, RouteUpdate};
+use crate::state::{AppState, RouteEntry, RouteState, Tombstone};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRouteRequest {
@@ -33,25 +33,35 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-pub async fn get_routes(State(state): State<AppState>) -> Json<RoutesResponse> {
-    let routes = state.routes.read().await;
+fn route_version(route: &RouteState) -> u64 {
+    match route {
+        RouteState::Active(entry) => entry.version,
+        RouteState::Deleted(tombstone) => tombstone.version,
+    }
+}
 
-    let routes = routes
+fn active_routes(routes: &HashMap<String, RouteState>) -> HashMap<String, RouteResponse> {
+    routes
         .iter()
-        .map(|(service, entry)| {
-            (
+        .filter_map(|(service, state)| match state {
+            RouteState::Active(entry) => Some((
                 service.clone(),
                 RouteResponse {
                     target: entry.target.clone(),
                     version: entry.version,
                 },
-            )
+            )),
+            RouteState::Deleted(_) => None,
         })
-        .collect();
+        .collect()
+}
+
+pub async fn get_routes(State(state): State<AppState>) -> Json<RoutesResponse> {
+    let routes = state.routes.read().await;
 
     Json(RoutesResponse {
         node: state.node_id.clone(),
-        routes,
+        routes: active_routes(&routes),
     })
 }
 
@@ -59,7 +69,9 @@ pub async fn create_route(
     State(state): State<AppState>,
     Json(request): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<RoutesResponse>), (StatusCode, Json<ErrorResponse>)> {
-    if request.service.trim().is_empty() {
+    let service = request.service.trim().to_string();
+
+    if service.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -80,7 +92,7 @@ pub async fn create_route(
     let version = state.next_version().await;
 
     let update = RouteUpdate {
-        service: request.service.clone(),
+        service: service.clone(),
         target: request.target.clone(),
         version,
     };
@@ -89,16 +101,15 @@ pub async fn create_route(
         let mut routes = state.routes.write().await;
 
         routes.insert(
-            request.service.clone(),
-            RouteEntry {
+            service.clone(),
+            RouteState::Active(RouteEntry {
                 target: request.target.clone(),
                 version,
-            },
+            }),
         );
     }
 
     let nodes = state.nodes.read().await.clone();
-
     let client = reqwest::Client::new();
 
     for node in nodes {
@@ -132,22 +143,9 @@ pub async fn create_route(
 
     let routes = state.routes.read().await;
 
-    let routes = routes
-        .iter()
-        .map(|(service, entry)| {
-            (
-                service.clone(),
-                RouteResponse {
-                    target: entry.target.clone(),
-                    version: entry.version,
-                },
-            )
-        })
-        .collect();
-
     let response = RoutesResponse {
         node: state.node_id.clone(),
-        routes,
+        routes: active_routes(&routes),
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -157,11 +155,61 @@ pub async fn delete_route(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> StatusCode {
-    let mut routes = state.routes.write().await;
+    let version = state.next_version().await;
 
-    if routes.remove(&service).is_some() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    {
+        let mut routes = state.routes.write().await;
+
+        match routes.get(&service) {
+            Some(existing) => {
+                if route_version(existing) >= version {
+                    return StatusCode::NOT_FOUND;
+                }
+            }
+            None => {
+                return StatusCode::NOT_FOUND;
+            }
+        }
+
+        routes.insert(service.clone(), RouteState::Deleted(Tombstone { version }));
     }
+
+    let update = DeleteUpdate {
+        service: service.clone(),
+        version,
+    };
+
+    let nodes = state.nodes.read().await.clone();
+    let client = reqwest::Client::new();
+
+    for node in nodes {
+        if node.id == state.node_id {
+            continue;
+        }
+
+        let url = format!("{}/internal/replicate-delete", node.address);
+
+        match client.post(&url).json(&update).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    println!(
+                        "Replicated delete '{}' version {} to {}",
+                        update.service, update.version, node.id
+                    );
+                } else {
+                    eprintln!(
+                        "Delete replication to {} failed with status {}",
+                        node.id,
+                        response.status()
+                    );
+                }
+            }
+
+            Err(error) => {
+                eprintln!("Delete replication to {} failed: {}", node.id, error);
+            }
+        }
+    }
+
+    StatusCode::NO_CONTENT
 }

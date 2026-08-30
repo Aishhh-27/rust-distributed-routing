@@ -1,4 +1,5 @@
 mod api;
+mod failure_detection;
 mod membership;
 mod node;
 mod replication;
@@ -13,7 +14,7 @@ use axum::{
     Router,
 };
 
-use state::{AppState, RouteEntry};
+use state::{AppState, RouteState};
 
 #[tokio::main]
 async fn main() {
@@ -48,6 +49,10 @@ async fn main() {
 
     println!("Starting {node_id} on {address}");
 
+    tokio::spawn(failure_detection::start(state.clone()));
+
+    tokio::spawn(failure_detection::start(state.clone()));
+
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("failed to bind");
@@ -56,7 +61,10 @@ async fn main() {
      * State recovery.
      *
      * When a node starts, ask the other known nodes for
-     * their current state and install any newer routes.
+     * their current state and install newer route states.
+     *
+     * Tombstones are recovered too, so a deleted route
+     * cannot reappear after a node restarts.
      */
     if node_id != "node-a" {
         let nodes = state.nodes.read().await.clone();
@@ -89,25 +97,30 @@ async fn main() {
                             let mut recovered = 0;
 
                             for (service, remote_entry) in remote_state.routes {
+                                let remote_version = match &remote_entry {
+                                    RouteState::Active(entry) => entry.version,
+                                    RouteState::Deleted(tombstone) => tombstone.version,
+                                };
+
                                 let should_update = match routes.get(&service) {
-                                    Some(local_entry) => remote_entry.version > local_entry.version,
+                                    Some(local_entry) => {
+                                        let local_version = match local_entry {
+                                            RouteState::Active(entry) => entry.version,
+                                            RouteState::Deleted(tombstone) => tombstone.version,
+                                        };
+
+                                        remote_version > local_version
+                                    }
                                     None => true,
                                 };
 
                                 if should_update {
-                                    routes.insert(
-                                        service.clone(),
-                                        RouteEntry {
-                                            target: remote_entry.target,
-                                            version: remote_entry.version,
-                                        },
-                                    );
-
+                                    routes.insert(service, remote_entry);
                                     recovered += 1;
                                 }
                             }
 
-                            println!("Recovered {} route(s) from {}", recovered, node.id);
+                            println!("Recovered {} route state(s) from {}", recovered, node.id);
                         }
 
                         Err(error) => {

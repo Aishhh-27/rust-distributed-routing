@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AppState, RouteEntry};
+use crate::state::{AppState, RouteEntry, RouteState, Tombstone};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteUpdate {
@@ -15,6 +15,13 @@ pub struct RouteUpdate {
 pub struct DeleteUpdate {
     pub service: String,
     pub version: u64,
+}
+
+fn route_version(route: &RouteState) -> u64 {
+    match route {
+        RouteState::Active(entry) => entry.version,
+        RouteState::Deleted(tombstone) => tombstone.version,
+    }
 }
 
 pub async fn replicate_route(
@@ -42,14 +49,16 @@ pub async fn replicate_route(
     let mut routes = state.routes.write().await;
 
     if let Some(existing) = routes.get(&update.service) {
-        if existing.version >= update.version {
+        let current_version = route_version(existing);
+
+        if current_version >= update.version {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "ignored",
                     "reason": "stale update",
                     "node": state.node_id,
-                    "current_version": existing.version,
+                    "current_version": current_version,
                     "received_version": update.version
                 })),
             );
@@ -58,10 +67,10 @@ pub async fn replicate_route(
 
     routes.insert(
         update.service,
-        RouteEntry {
+        RouteState::Active(RouteEntry {
             target: update.target,
             version: update.version,
-        },
+        }),
     );
 
     (
@@ -90,21 +99,28 @@ pub async fn replicate_delete(
     let mut routes = state.routes.write().await;
 
     if let Some(existing) = routes.get(&update.service) {
-        if existing.version >= update.version {
+        let current_version = route_version(existing);
+
+        if current_version >= update.version {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "ignored",
                     "reason": "stale delete",
                     "node": state.node_id,
-                    "current_version": existing.version,
+                    "current_version": current_version,
                     "received_version": update.version
                 })),
             );
         }
     }
 
-    routes.remove(&update.service);
+    routes.insert(
+        update.service,
+        RouteState::Deleted(Tombstone {
+            version: update.version,
+        }),
+    );
 
     (
         StatusCode::OK,

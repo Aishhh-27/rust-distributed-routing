@@ -3,7 +3,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::state::{AppState, RouteEntry};
+use crate::state::{AppState, RouteState};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -20,7 +20,7 @@ pub struct NodeInfoResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StateResponse {
-    pub routes: HashMap<String, RouteEntry>,
+    pub routes: HashMap<String, RouteState>,
 }
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
