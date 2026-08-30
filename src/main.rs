@@ -51,8 +51,6 @@ async fn main() {
 
     tokio::spawn(failure_detection::start(state.clone()));
 
-    tokio::spawn(failure_detection::start(state.clone()));
-
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("failed to bind");
